@@ -3784,14 +3784,26 @@ class PlaybackService : MediaLibraryService() {
         // track, so the two further attempts this would otherwise spend are two
         // more full walks for an answer already in hand — and in the report they
         // were exactly that, at roughly seventeen youtubei requests each.
-        val verdict = permanentReason(error)
-        val givingUp = verdict != null || attempts > MAX_RECOVERIES
         // A track that has never made a sound has *failed to start*, whatever
         // the error was, and the queue should move past it once the attempts are
         // spent — see [skipReason]. Read here rather than after the delay below,
         // because the seek-and-prepare of an unrelated recovery could move the
         // player on in between.
         val neverStarted = audibleMediaId != mediaId
+        // A resolve that ran out of time is final for a track that never
+        // started — the listener has already waited the whole budget — but not
+        // for one already playing, where it is a re-open (a seek, a cache
+        // continuation) that deserves the ordinary retries before the song is
+        // cut off mid-way.
+        val timedOut = isResolveTimeout(error)
+        val verdict = permanentReason(error)?.takeUnless { timedOut && !neverStarted }
+        val givingUp = verdict != null || attempts > MAX_RECOVERIES
+        if (timedOut && neverStarted) {
+            // Said out loud: without it the listener sees only a spinner that
+            // stops and a different song starting, with no idea why.
+            Toast.makeText(applicationContext, "Couldn't load this song in time — skipping", Toast.LENGTH_SHORT)
+                .show()
+        }
         if (verdict != null) {
             TrackLog.w("BitChord", "$mediaId cannot be played: $verdict", about = mediaId)
         } else if (givingUp) {
@@ -4190,6 +4202,17 @@ class PlaybackService : MediaLibraryService() {
      * what the resolver actually threw. A shallow `is` check sees only the
      * outermost of those three.
      */
+    /** Whether [error] is the resolver giving up on its deadline; see [StreamResolver.ResolveTimeoutException]. */
+    private fun isResolveTimeout(error: Throwable?): Boolean {
+        var cause = error
+        var depth = 0
+        while (cause != null && depth++ < PERMANENT_CAUSE_DEPTH) {
+            if (cause is StreamResolver.ResolveTimeoutException) return true
+            cause = cause.cause?.takeIf { it !== cause }
+        }
+        return false
+    }
+
     private fun permanentReason(error: Throwable?): String? {
         var cause = error
         var depth = 0

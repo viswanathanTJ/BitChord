@@ -15,6 +15,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.ConnectionPool
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -307,7 +308,17 @@ object StreamResolver {
      * [PlaybackService][com.music.bitchord.playback.PlaybackService]'s load-error
      * policy and `recoverFrom`.
      */
-    class PermanentlyUnplayableException(reason: String) : IOException(reason)
+    open class PermanentlyUnplayableException(reason: String) : IOException(reason)
+
+    /**
+     * The whole walk ran past [RESOLVE_DEADLINE_MS] without a stream.
+     *
+     * A [PermanentlyUnplayableException] so that nothing above stacks retries
+     * on it — ExoPlayer's policy and `recoverFrom` both stop at that type —
+     * but deliberately *not* remembered as a verdict: a slow network now says
+     * nothing about the next time the listener presses play.
+     */
+    class ResolveTimeoutException(reason: String) : PermanentlyUnplayableException(reason)
 
     /**
      * Tracks that have already failed for a reason retrying cannot fix, and
@@ -364,6 +375,9 @@ object StreamResolver {
     }
 
     private const val UNPLAYABLE_TTL_MS = 10 * 60 * 1000L
+
+    /** Total budget for one walk; see [resolveUncached]. */
+    private const val RESOLVE_DEADLINE_MS = 25_000L
 
     /**
      * One walk per videoId at a time.
@@ -423,8 +437,30 @@ object StreamResolver {
 
     private val resolverScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    /**
+     * One walk, bounded as a whole.
+     *
+     * Every step inside has its own timeout, but nothing bounded their sum: a
+     * walk of refused clients, a cold PoToken mint and three extractions could
+     * run for minutes, and the retries stacked above multiplied that. The
+     * patched YouTube Music client gives its own client walk a single 20s
+     * budget and then gives up; this does the same, with a little more room
+     * for the cold cipher solve this app pays on first launch.
+     */
     private suspend fun resolveUncached(videoId: String): Stream {
         val resolveStart = MonotonicClock.nowMs()
+        return withTimeoutOrNull(RESOLVE_DEADLINE_MS) { walk(videoId, resolveStart) }
+            ?: run {
+                TrackLog.w(
+                    TAG,
+                    "resolve for $videoId gave up after ${MonotonicClock.nowMs() - resolveStart}ms " +
+                        "(deadline ${RESOLVE_DEADLINE_MS}ms)",
+                )
+                throw ResolveTimeoutException("YouTube didn't return a stream in time")
+            }
+    }
+
+    private suspend fun walk(videoId: String, resolveStart: Long): Stream {
         val stream = try {
             timed("$videoId InnerTubeX") { innerTubeXStreamAllowingUploads(videoId) }
                 ?: run {
